@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.volcengine_llm import LLMRateLimitError
 
 
 @dataclass
@@ -137,10 +138,24 @@ class FakeWorkflow:
         yield {"workflow": "updated"}
 
 
+class RateLimitedWorkflow:
+    """模拟上游模型限流，用于验证 API 不会将其错误地转成 500。"""
+
+    async def ainvoke(self, *_: Any, **__: Any) -> None:
+        raise LLMRateLimitError("AI 服务繁忙，请稍后重试。")
+
+
 @asynccontextmanager
 async def memory_workflow_lifespan(test_app: FastAPI) -> AsyncIterator[None]:
     """为 HTTP 测试注入内存版工作流，避免连接外部服务。"""
     test_app.state.content_graph = FakeWorkflow()
+    yield
+
+
+@asynccontextmanager
+async def rate_limited_workflow_lifespan(test_app: FastAPI) -> AsyncIterator[None]:
+    """为限流测试注入会失败的工作流。"""
+    test_app.state.content_graph = RateLimitedWorkflow()
     yield
 
 
@@ -167,6 +182,17 @@ def test_health_check(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_start_surfaces_upstream_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ark 限流时应返回 429，而不是不透明的 500。"""
+    monkeypatch.setattr(app.router, "lifespan_context", rate_limited_workflow_lifespan)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/api/v1/workflow/start", json={"topic_direction": "AI 内容运营"})
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "AI 服务繁忙，请稍后重试。"
 
 
 def test_start_state_and_history(client: TestClient) -> None:

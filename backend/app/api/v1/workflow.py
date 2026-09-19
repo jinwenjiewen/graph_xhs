@@ -8,6 +8,8 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from app.services.volcengine_llm import LLMRateLimitError, LLMServiceError
+
 router = APIRouter(prefix="/workflow", tags=["workflow"])
 
 
@@ -94,6 +96,10 @@ async def start_workflow(payload: StartWorkflowRequest, request: Request) -> dic
 
         snapshot = await graph.aget_state(config)   #`aget_state`读取当前线程的状态快照
 
+    except LLMRateLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    except LLMServiceError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"启动工作流失败: {exc}") from exc
 
@@ -186,6 +192,10 @@ async def resume_workflow(
         updated_snapshot = await graph.aget_state(config)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LLMRateLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    except LLMServiceError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"恢复工作流失败: {exc}") from exc
 

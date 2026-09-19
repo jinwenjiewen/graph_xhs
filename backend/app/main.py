@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
 from fastapi import FastAPI
 import uvicorn
 
+from app.api.v1.images import router as image_router
 from app.api.v1.workflow import router as workflow_router
 from app.core.config import settings
 from app.core.db import close_db, init_db
@@ -69,6 +70,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(workflow_router, prefix="/api/v1")
+app.include_router(image_router, prefix="/api/v1")
 
 
 @app.get("/health")

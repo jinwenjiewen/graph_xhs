@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from app.graph.state import AgentState
-from app.services.image_mock import MockImageService
 from app.services.llm_mock import MockLLMService
+from app.services.volcengine_image import ArkImageService
+from app.services.volcengine_llm import VolcengineTextLLMService
 
-_llm = MockLLMService()
-_images = MockImageService()
+# 文字、图片均通过火山引擎 Ark 生成；配图要点目前保持本地确定性提取，
+# 便于工作流在不增加额外 LLM 调用的情况下稳定运行。
+_text_llm = VolcengineTextLLMService()
+_image_llm = MockLLMService()
+_images = ArkImageService()
 
 
 async def plan_topics(state: AgentState) -> dict[str, object]:
     """根据用户的初始方向生成候选选题。"""
-    topics = await _llm.plan_topics(state["topic_direction"])
+    topics = await _text_llm.plan_topics(state["topic_direction"])
     # 不直接进入写作：状态机会在下一个节点前中断，等待编辑确认选题。
     return {"generated_topics": topics, "status": "awaiting_topic_selection"}
 
@@ -27,7 +31,7 @@ async def human_selection_node(state: AgentState) -> dict[str, object]:
 
 async def write_draft(state: AgentState) -> dict[str, object]:
     """根据编辑反馈撰写或重写文章。"""
-    draft = await _llm.write_draft(
+    draft = await _text_llm.write_draft(
         state.get("selected_topic", ""), state.get("review_feedback", "")
     )
     # 驳回后的反馈会保留在状态中，因此本节点既承担首稿生成也承担重写。
@@ -52,11 +56,11 @@ def route_after_review(state: AgentState) -> str:
 
 async def extract_visuals(state: AgentState) -> dict[str, object]:
     """从已通过审核的文章中提炼配图提示要点。"""
-    points = await _llm.extract_visual_points(state.get("article_content", ""))
+    points = await _image_llm.extract_visual_points(state.get("article_content", ""))
     return {"visual_points": points, "status": "generating_images"}
 
 
 async def generate_images(state: AgentState) -> dict[str, object]:
-    """为已通过审核的文章生成固定的占位图片。"""
+    """为已通过审核的文章调用 Ark 图像模型生成配图。"""
     urls = await _images.generate_images(state.get("visual_points", []))
     return {"image_urls": urls, "status": "completed"}
