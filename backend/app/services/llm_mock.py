@@ -20,11 +20,23 @@ class MockLLMService:
         return revised_prefix + body
 
     async def extract_visual_points(self, article_content: str) -> list[str]:
-        """从非空文章草稿中提取固定的配图文案要点。"""
-        if not article_content.strip():
+        """为本地演示从文章标题构造带主题的确定性配图文案。"""
+        article = article_content.strip()
+        if not article:
             raise ValueError("无法从空文章中提炼配图要点")
+
+        title = next(
+            (
+                line.removeprefix("#").strip()
+                for line in article.splitlines()
+                if line.lstrip().startswith("#") and line.removeprefix("#").strip()
+            ),
+            "文章核心主题",
+        )
         return [
-            "工作流全景：选题、写作、审稿、配图",
-            "人工审核与自动化协作示意",
-            "内容运营的数据复盘闭环",
+            f"围绕“{title}”的首图，突出文章主题和读者使用场景，干净的小红书插画风格",
+            f"围绕“{title}”开篇读者痛点的场景图，人物与环境具体、画面有代入感",
+            f"围绕“{title}”核心方法的步骤示意图，层次清晰、主体明确、简洁信息图风格",
+            f"围绕“{title}”实践动作或案例的应用图，突出关键操作与使用效果，现代插画风格",
+            f"围绕“{title}”行动建议的收尾画面，传达完成与复盘感，温暖现代插画风格",
         ]

@@ -19,6 +19,8 @@ interface FlowStep {
 }
 
 const STORAGE_KEY = 'content-agent-thread-id'
+const WORKFLOW_ITEM_COUNT = 5
+const IMAGE_ROLE_LABELS = ['首图', '场景图', '方法图', '应用图', '收尾图']
 const topicDirection = ref('')
 const workflow = ref<WorkflowSnapshot | null>(null)
 const history = ref<HistoryEntry[]>([])
@@ -34,9 +36,12 @@ let pollTimer: number | undefined
 const state = computed(() => workflow.value?.state)
 const threadId = computed(() => workflow.value?.thread_id || '')
 const generatedTopics = computed(() => state.value?.generated_topics || workflow.value?.generated_topics || [])
+const visualPoints = computed(() => state.value?.visual_points || [])
+const imageUrls = computed(() => state.value?.image_urls || [])
 const isWaitingTopic = computed(() => workflow.value?.next.includes('human_selection_node') ?? false)
 const isWaitingReview = computed(() => workflow.value?.next.includes('human_review_node') ?? false)
 const isCompleted = computed(() => workflow.value?.status === 'completed')
+const isExpectedCount = (items: unknown[]) => items.length === WORKFLOW_ITEM_COUNT
 const statusLabel = computed(() => {
   const labels: Record<string, string> = {
     awaiting_topic_selection: '等待选择选题',
@@ -55,12 +60,12 @@ const statusLabel = computed(() => {
 const flowSteps = computed<FlowStep[]>(() => {
   const current = workflow.value
   const agentState = current?.state
-  const hasTopics = Boolean(agentState?.generated_topics?.length)
+  const hasTopics = isExpectedCount(generatedTopics.value)
   const hasSelected = Boolean(agentState?.selected_topic)
   const hasDraft = Boolean(agentState?.article_content)
   const hasDecision = Boolean(agentState?.review_decision)
-  const hasVisuals = Boolean(agentState?.visual_points?.length)
-  const hasImages = Boolean(agentState?.image_urls?.length)
+  const hasVisuals = isExpectedCount(visualPoints.value)
+  const hasImages = isExpectedCount(imageUrls.value)
   const currentNode = current?.next[0]
 
   return [
@@ -69,7 +74,7 @@ const flowSteps = computed<FlowStep[]>(() => {
     { key: 'draft', title: '撰写草稿', description: '写作 Agent', state: hasDraft ? 'completed' : hasSelected ? 'current' : 'pending' },
     { key: 'review', title: '审核内容', description: '人工决策', state: hasDecision && !isWaitingReview.value ? 'completed' : currentNode === 'human_review_node' ? 'current' : 'pending' },
     { key: 'visuals', title: '提炼配图', description: '视觉 Agent', state: hasVisuals ? 'completed' : hasDecision && agentState?.review_decision === 'approved' ? 'current' : 'pending' },
-    { key: 'images', title: '生成配图', description: '图像 Agent', state: hasImages || isCompleted.value ? 'completed' : hasVisuals ? 'current' : 'pending' },
+    { key: 'images', title: '生成配图', description: '图像 Agent', state: hasImages ? 'completed' : hasVisuals ? 'current' : 'pending' },
   ]
 })
 
@@ -103,6 +108,10 @@ function timelineText(item: HistoryEntry) {
     completed: '文章与配图已生成，工作流完成',
   }
   return map[item.status] || `状态更新为 ${item.status}`
+}
+
+function imageLabel(index: number) {
+  return IMAGE_ROLE_LABELS[index] || `配图 ${index + 1}`
 }
 
 function applySnapshot(snapshot: WorkflowSnapshot) {
@@ -238,7 +247,7 @@ onBeforeUnmount(() => {
           <p class="eyebrow">01 · 创建任务</p>
           <h2>你想写什么内容？</h2>
         </div>
-        <span class="subtle">规划 Agent 会给出多个可选选题</span>
+        <span class="subtle">规划 Agent 会给出 {{ WORKFLOW_ITEM_COUNT }} 个可选选题</span>
       </div>
       <form class="task-form" @submit.prevent="createWorkflow">
         <label for="topic-direction">内容方向</label>
@@ -287,10 +296,10 @@ onBeforeUnmount(() => {
               </div>
               <span class="waiting-label">已暂停</span>
             </div>
-            <p class="card-copy">规划 Agent 已完成分析。选定方向后，写作 Agent 会继续生成文章草稿。</p>
+            <p class="card-copy">规划 Agent 已完成分析，已生成 {{ generatedTopics.length }} / {{ WORKFLOW_ITEM_COUNT }} 个候选。选定方向后，写作 Agent 会继续生成文章草稿。</p>
             <div class="topic-list">
-              <button v-for="topic in generatedTopics" :key="topic" class="topic-option" type="button" :disabled="actionLoading" @click="takeAction('select_topic', topic)">
-                <span class="topic-number">{{ generatedTopics.indexOf(topic) + 1 }}</span>
+              <button v-for="(topic, index) in generatedTopics" :key="`${index}-${topic}`" class="topic-option" type="button" :disabled="actionLoading" @click="takeAction('select_topic', topic)">
+                <span class="topic-number">{{ index + 1 }}</span>
                 <span>{{ topic }}</span>
                 <span class="arrow">→</span>
               </button>
@@ -317,7 +326,7 @@ onBeforeUnmount(() => {
               </div>
               <span class="waiting-label">已暂停</span>
             </div>
-            <p class="card-copy">通过后将自动提炼视觉要点并生成配图；驳回时会将你的意见交给写作 Agent 重写。</p>
+            <p class="card-copy">通过后将自动提炼 5 条视觉要点，并生成首图、场景图、方法图、应用图和收尾图；驳回时会将你的意见交给写作 Agent 重写。</p>
             <label class="feedback-label" for="feedback">修改意见 <em>驳回时必填</em></label>
             <textarea id="feedback" v-model="feedback" maxlength="1000" placeholder="例如：语气更轻松一些，并补充一个具体案例" :disabled="actionLoading"></textarea>
             <div class="review-actions">
@@ -326,27 +335,36 @@ onBeforeUnmount(() => {
             </div>
           </article>
 
-          <article v-if="state?.visual_points?.length" class="visual-card card">
+          <article v-if="visualPoints.length" class="visual-card card">
             <div class="card-title-row">
               <div>
                 <p class="eyebrow">视觉规划</p>
                 <h2>已提炼配图要点</h2>
               </div>
+              <span class="neutral-label">{{ visualPoints.length }} / {{ WORKFLOW_ITEM_COUNT }} 条</span>
             </div>
-            <div class="tag-list"><span v-for="point in state.visual_points" :key="point" class="tag">{{ point }}</span></div>
+            <ol class="visual-list">
+              <li v-for="(point, index) in visualPoints" :key="`${index}-${point}`">
+                <span class="visual-number">{{ index + 1 }}</span>
+                <p>{{ point }}</p>
+              </li>
+            </ol>
           </article>
 
-          <article v-if="state?.image_urls?.length" class="images-card card">
+          <article v-if="imageUrls.length" class="images-card card">
             <div class="card-title-row">
               <div>
                 <p class="eyebrow">生成结果</p>
                 <h2>文章配图</h2>
               </div>
-              <span class="complete-label">已完成</span>
+              <span :class="isExpectedCount(imageUrls) ? 'complete-label' : 'neutral-label'">
+                {{ isExpectedCount(imageUrls) ? '已完成' : '已生成' }} {{ imageUrls.length }} / {{ WORKFLOW_ITEM_COUNT }} 张
+              </span>
             </div>
             <div class="image-grid">
-              <a v-for="(url, index) in state.image_urls" :key="url" :href="url" target="_blank" rel="noreferrer" :aria-label="`查看配图 ${index + 1}`">
-                <img :src="url" :alt="`文章配图 ${index + 1}`" />
+              <a v-for="(url, index) in imageUrls" :key="`${index}-${url}`" :href="url" target="_blank" rel="noreferrer" :aria-label="`查看${imageLabel(index)}`">
+                <img :src="url" :alt="`文章${imageLabel(index)}`" />
+                <span>{{ imageLabel(index) }}</span>
               </a>
             </div>
           </article>

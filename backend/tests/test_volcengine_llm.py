@@ -15,6 +15,7 @@ from app.services.volcengine_llm import (
     DRAFT_SYSTEM_PROMPT,
     LLMRateLimitError,
     TOPIC_SYSTEM_PROMPT,
+    VISUAL_SYSTEM_PROMPT,
     VolcengineTextLLMService,
 )
 
@@ -74,21 +75,21 @@ def _service_with(client: FakeChatClient) -> VolcengineTextLLMService:
 def test_parse_topics_accepts_json_code_fence() -> None:
     """即使模型违反格式约定包裹了代码块，仍能兼容解析。"""
     topics = VolcengineTextLLMService._parse_topics(
-        "```json\n[\"选题一\", \"选题二\", \"选题三\"]\n```"
+        "```json\n[\"选题一\", \"选题二\", \"选题三\", \"选题四\", \"选题五\"]\n```"
     )
 
-    assert topics == ["选题一", "选题二", "选题三"]
+    assert topics == ["选题一", "选题二", "选题三", "选题四", "选题五"]
 
 
 @pytest.mark.asyncio
 async def test_plan_topics_uses_topic_prompt_and_parses_response() -> None:
-    """选题调用应发送既定系统提示词并返回三条标题。"""
-    client = FakeChatClient('["选题一", "选题二", "选题三"]')
+    """选题调用应发送既定系统提示词并返回五条标题。"""
+    client = FakeChatClient('["选题一", "选题二", "选题三", "选题四", "选题五"]')
     service = _service_with(client)
 
     topics = await service.plan_topics("AI 内容运营")
 
-    assert topics == ["选题一", "选题二", "选题三"]
+    assert topics == ["选题一", "选题二", "选题三", "选题四", "选题五"]
     assert client.messages[0].content == TOPIC_SYSTEM_PROMPT
     assert "<内容方向>\nAI 内容运营\n</内容方向>" in client.messages[1].content
 
@@ -104,6 +105,35 @@ async def test_write_draft_keeps_review_feedback_as_content() -> None:
     assert draft == "# 修改后的文章\n\n正文"
     assert client.messages[0].content == DRAFT_SYSTEM_PROMPT
     assert "补充一个示例" in client.messages[1].content
+
+
+@pytest.mark.asyncio
+async def test_extract_visual_points_uses_the_complete_article() -> None:
+    """配图规划必须以审核后的正文为素材，而不是使用固定通用文案。"""
+    client = FakeChatClient(
+        '["一位职场新人用 AI 整理会议纪要，桌面俯拍，温暖自然光", '
+        '"职场新人面对冗长会议录音感到无从下手，办公桌场景，真实纪实风格", '
+        '"会议录音、要点卡片与待办事项组成清晰流程图，极简信息图风格", '
+        '"职场新人将 AI 提取的待办逐项写入日历，突出实践动作，干净现代插画", '
+        '"新人完成当天待办后轻松复盘，笔记本与日历构成收尾画面"]'
+    )
+    service = _service_with(client)
+    article = "# 职场新人用 AI 整理会议纪要\n\n把录音整理成待办事项，减少遗漏。"
+
+    points = await service.extract_visual_points(article)
+
+    assert len(points) == 5
+    assert client.messages[0].content == VISUAL_SYSTEM_PROMPT
+    assert client.messages[1].content == f"<文章正文>\n{article}\n</文章正文>"
+
+
+@pytest.mark.asyncio
+async def test_extract_visual_points_rejects_invalid_result() -> None:
+    """上游未按五图契约输出时，不应将不完整提示词交给图像模型。"""
+    service = _service_with(FakeChatClient('["只返回了一张图"]'))
+
+    with pytest.raises(ValueError, match="恰好 5 条"):
+        await service.extract_visual_points("# 任意文章\n\n正文")
 
 
 @pytest.mark.asyncio
@@ -123,7 +153,9 @@ async def test_rate_limit_is_retried_with_delay(monkeypatch: pytest.MonkeyPatch)
         response=Response(429, request=Request("POST", "https://example.test/v3")),
         body={},
     )
-    client = RetryingFakeChatClient([rate_limit, '["选题一", "选题二", "选题三"]'])
+    client = RetryingFakeChatClient(
+        [rate_limit, '["选题一", "选题二", "选题三", "选题四", "选题五"]']
+    )
     service = _service_with(client)
     delays: list[float] = []
 
@@ -132,7 +164,13 @@ async def test_rate_limit_is_retried_with_delay(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("app.services.volcengine_llm.asyncio.sleep", fake_sleep)
 
-    assert await service.plan_topics("AI 内容运营") == ["选题一", "选题二", "选题三"]
+    assert await service.plan_topics("AI 内容运营") == [
+        "选题一",
+        "选题二",
+        "选题三",
+        "选题四",
+        "选题五",
+    ]
     assert client.calls == 2
     assert delays == [2.0]
 

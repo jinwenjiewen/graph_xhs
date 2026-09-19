@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 from app.graph.state import AgentState
-from app.services.llm_mock import MockLLMService
 from app.services.volcengine_image import ArkImageService
 from app.services.volcengine_llm import VolcengineTextLLMService
 
-# 文字、图片均通过火山引擎 Ark 生成；配图要点目前保持本地确定性提取，
-# 便于工作流在不增加额外 LLM 调用的情况下稳定运行。
+# 文字、配图要点与图片均使用生产模型。配图要点必须从已审核的正文提炼，
+# 不能使用固定文案，否则图片会与实际撰写内容脱节。
 _text_llm = VolcengineTextLLMService()
-_image_llm = MockLLMService()
 _images = ArkImageService()
 
 
@@ -56,7 +54,7 @@ def route_after_review(state: AgentState) -> str:
 
 async def extract_visuals(state: AgentState) -> dict[str, object]:
     """从已通过审核的文章中提炼配图提示要点。"""
-    points = await _image_llm.extract_visual_points(state.get("article_content", ""))
+    points = await _text_llm.extract_visual_points(state.get("article_content", ""))
     return {"visual_points": points, "status": "generating_images"}
 
 

@@ -30,7 +30,7 @@ class FakeSnapshot:
 class FakeWorkflow:
     """模拟工作流状态机，覆盖路由层需要的 LangGraph 接口。"""
 
-    topics = ["LangGraph入门", "AI Agent实战", "Python高并发"]
+    topics = ["LangGraph入门", "AI Agent实战", "Python高并发", "RAG 应用", "提示词工程"]
 
     def __init__(self) -> None:
         self._snapshots: dict[str, list[FakeSnapshot]] = {}
@@ -119,8 +119,20 @@ class FakeWorkflow:
                 thread_id,
                 {
                     **current.values,
-                    "visual_points": ["文章工作流示意图"],
-                    "image_urls": ["https://placehold.co/1200x800/png?text=workflow"],
+                    "visual_points": [
+                        "文章工作流首图",
+                        "文章工作流场景图",
+                        "文章工作流方法图",
+                        "文章工作流应用图",
+                        "文章工作流总结图",
+                    ],
+                    "image_urls": [
+                        "https://placehold.co/1200x800/png?text=workflow-1",
+                        "https://placehold.co/1200x800/png?text=workflow-2",
+                        "https://placehold.co/1200x800/png?text=workflow-3",
+                        "https://placehold.co/1200x800/png?text=workflow-4",
+                        "https://placehold.co/1200x800/png?text=workflow-5",
+                    ],
                     "status": "completed",
                 },
                 (),
@@ -204,6 +216,7 @@ def test_start_state_and_history(client: TestClient) -> None:
     assert started["interrupted"] is True
     assert started["next"] == ["human_selection_node"]
     assert started["generated_topics"] == FakeWorkflow.topics
+    assert len(started["generated_topics"]) == 5
 
     state_response = client.get(f"/api/v1/workflow/state/{thread_id}")
     history_response = client.get(f"/api/v1/workflow/history/{thread_id}")
@@ -250,6 +263,8 @@ def test_resume_reject_then_approve_and_history(client: TestClient) -> None:
     assert completed["message"] == "文章审核已通过，配图已生成"
     assert completed["interrupted"] is False
     assert completed["state"]["image_urls"]
+    assert len(completed["state"]["visual_points"]) == 5
+    assert len(completed["state"]["image_urls"]) == 5
 
     history_response = client.get(f"/api/v1/workflow/history/{thread_id}?limit=100")
     assert history_response.status_code == 200

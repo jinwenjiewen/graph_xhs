@@ -91,11 +91,14 @@ input::placeholder, textarea::placeholder { color: #adb6c5; }
 .feedback-label { margin-top: 18px; }
 .feedback-label em { color: #a0a9b7; font-style: normal; font-weight: 400; }
 .review-actions { justify-content: flex-end; gap: 9px; margin-top: 15px; }
-.tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
-.tag { padding: 6px 9px; border-radius: 6px; color: #60708b; background: #f1f4f8; font-size: 12px; }
-.image-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-top: 19px; }
-.image-grid a { display: block; overflow: hidden; border-radius: 9px; background: #f3f5f8; }
+.visual-list { display: grid; gap: 9px; margin: 18px 0 0; padding: 0; list-style: none; }
+.visual-list li { display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: start; gap: 10px; padding: 10px 11px; border-radius: 8px; background: #f6f8fb; }
+.visual-number { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: #5363c7; background: #e9edff; font-size: 11px; font-weight: 700; }
+.visual-list p { margin: 1px 0 0; color: #60708b; font-size: 12px; line-height: 1.6; }
+.image-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 19px; }
+.image-grid a { display: block; overflow: hidden; border-radius: 9px; color: #62718a; background: #f3f5f8; font-size: 11px; text-decoration: none; }
 .image-grid img { display: block; width: 100%; aspect-ratio: 1.5; object-fit: cover; transition: transform .25s; }
+.image-grid a > span { display: block; padding: 8px 10px; }
 .image-grid a:hover img { transform: scale(1.025); }
 
 .activity-panel { position: sticky; top: 20px; padding: 18px 18px 20px; }
@@ -127,6 +130,10 @@ input::placeholder, textarea::placeholder { color: #adb6c5; }
   .flow-step { min-width: 96px; }
 }
 
+@media (max-width: 700px) {
+  .image-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 @media (max-width: 540px) {
   .topbar { height: 65px; }
   .thread-id { display: none; }
@@ -138,4 +145,5 @@ input::placeholder, textarea::placeholder { color: #adb6c5; }
   .review-actions button { width: 100%; }
   .flow-step { min-width: 90px; }
   .flow-line { min-width: 18px; }
+  .image-grid { grid-template-columns: 1fr; }
 }
