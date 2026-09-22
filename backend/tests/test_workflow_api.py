@@ -34,7 +34,11 @@ class FakeWorkflow:
 
     def __init__(self) -> None:
         self._snapshots: dict[str, list[FakeSnapshot]] = {}
+        self._checkpoint_stream: list[FakeSnapshot] = []
         self._sequence = 0
+        self._listing_checkpoints = False
+        # 路由层通过 checkpointer 的全量迭代能力列出历史会话；测试中由自身模拟。
+        self.checkpointer = self
 
     def _thread_id(self, config: dict[str, dict[str, str]]) -> str:
         return config["configurable"]["thread_id"]
@@ -55,6 +59,25 @@ class FakeWorkflow:
             created_at=(datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=self._sequence)).isoformat(),
         )
         self._snapshots.setdefault(thread_id, []).append(snapshot)
+        self._checkpoint_stream.append(snapshot)
+
+    async def alist(self, _: None) -> AsyncIterator[FakeSnapshot]:
+        """模拟 Checkpointer 按新到旧列出全局检查点。"""
+        self._listing_checkpoints = True
+        try:
+            for snapshot in reversed(self._checkpoint_stream):
+                yield snapshot
+        finally:
+            self._listing_checkpoints = False
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        """模拟删除一个线程的所有检查点。"""
+        self._snapshots.pop(thread_id, None)
+        self._checkpoint_stream = [
+            snapshot
+            for snapshot in self._checkpoint_stream
+            if snapshot.config["configurable"]["thread_id"] != thread_id
+        ]
 
     async def ainvoke(self, values: dict[str, Any], config: dict[str, dict[str, str]]) -> None:
         thread_id = self._thread_id(config)
@@ -69,6 +92,10 @@ class FakeWorkflow:
         )
 
     async def aget_state(self, config: dict[str, dict[str, str]]) -> FakeSnapshot:
+        # PostgreSQL 的 Checkpointer 在全局迭代期间仍占有游标；模拟这一限制，
+        # 防止路由改回“遍历时读取状态”而导致生产请求卡住。
+        if self._listing_checkpoints:
+            raise RuntimeError("cannot read state while checkpoint cursor is open")
         thread_id = self._thread_id(config)
         snapshots = self._snapshots.get(thread_id)
         if not snapshots:
@@ -231,6 +258,88 @@ def test_start_state_and_history(client: TestClient) -> None:
     assert history[0]["metadata"] == {"step": 1}
 
 
+def test_list_threads_returns_latest_unique_sessions(client: TestClient) -> None:
+    """历史会话列表应按最近更新排序，且每个 thread_id 只出现一次。"""
+    first_thread_id, first_started = _start_workflow(client)
+    second_response = client.post(
+        "/api/v1/workflow/start", json={"topic_direction": "小红书内容运营"}
+    )
+    assert second_response.status_code == 201
+    second_thread_id = second_response.json()["thread_id"]
+
+    resume_response = client.post(
+        f"/api/v1/workflow/resume/{first_thread_id}",
+        json={"action": "select_topic", "data": {"selected_topic": first_started["generated_topics"][0]}},
+    )
+    assert resume_response.status_code == 200
+
+    response = client.get("/api/v1/workflow/threads?limit=10")
+
+    assert response.status_code == 200
+    threads = response.json()["threads"]
+    assert [thread["thread_id"] for thread in threads] == [first_thread_id, second_thread_id]
+    assert threads[0]["topic_direction"] == "AI 内容运营"
+    assert threads[0]["selected_topic"] == first_started["generated_topics"][0]
+    assert threads[0]["status"] == "awaiting_review"
+    assert threads[0]["next"] == ["human_review_node"]
+    assert threads[0]["interrupted"] is True
+    assert threads[0]["updated_at"]
+
+
+def test_delete_thread_removes_only_that_session(client: TestClient) -> None:
+    """删除单条历史会话后，该线程的状态、历史和列表记录都应消失。"""
+    deleted_thread_id, _ = _start_workflow(client)
+    retained_thread_id, _ = _start_workflow(client)
+
+    response = client.delete(f"/api/v1/workflow/threads/{deleted_thread_id}")
+
+    assert response.status_code == 200
+    assert response.json() == {"thread_id": deleted_thread_id, "message": "历史会话已删除"}
+    assert client.get(f"/api/v1/workflow/state/{deleted_thread_id}").status_code == 404
+    assert client.get(f"/api/v1/workflow/history/{deleted_thread_id}").status_code == 404
+    thread_ids = {
+        item["thread_id"] for item in client.get("/api/v1/workflow/threads").json()["threads"]
+    }
+    assert deleted_thread_id not in thread_ids
+    assert retained_thread_id in thread_ids
+    assert client.delete("/api/v1/workflow/threads/not-found").status_code == 404
+
+
+def test_historical_automatic_thread_can_be_loaded_and_continued(client: TestClient) -> None:
+    """切回历史的自动节点线程后，仍可读取状态并从检查点继续。"""
+    historical_thread_id, started = _start_workflow(client)
+    workflow = client.app.state.content_graph
+    workflow._save(
+        historical_thread_id,
+        {
+            **started["state"],
+            "review_decision": "approved",
+            "status": "generating_images",
+        },
+        ("generate_images",),
+    )
+    # 新建另一会话，确保待恢复线程确实是“历史会话”而不是当前唯一会话。
+    _start_workflow(client)
+
+    threads_response = client.get("/api/v1/workflow/threads")
+    assert threads_response.status_code == 200
+    historical_summary = next(
+        item
+        for item in threads_response.json()["threads"]
+        if item["thread_id"] == historical_thread_id
+    )
+    assert historical_summary["status"] == "generating_images"
+    assert historical_summary["next"] == ["generate_images"]
+
+    state_response = client.get(f"/api/v1/workflow/state/{historical_thread_id}")
+    assert state_response.status_code == 200
+    assert state_response.json()["status"] == "generating_images"
+
+    continue_response = client.post(f"/api/v1/workflow/continue/{historical_thread_id}")
+    assert continue_response.status_code == 200
+    assert continue_response.json()["status"] == "completed"
+
+
 def test_resume_reject_then_approve_and_history(client: TestClient) -> None:
     """选题、驳回重写和通过完成应形成完整可查询的历史。"""
     thread_id, started = _start_workflow(client)
@@ -328,3 +437,28 @@ def test_invalid_resume_state_and_payload(client: TestClient) -> None:
         f"/api/v1/workflow/resume/{thread_id}",
         json={"action": "select_topic", "data": {"selected_topic": FakeWorkflow.topics[0]}},
     ).status_code == 409
+
+
+def test_continue_resumes_automatic_node_from_checkpoint(client: TestClient) -> None:
+    """自动节点中断后可从检查点继续，人工节点则必须走对应决策接口。"""
+    thread_id, started = _start_workflow(client)
+
+    waiting_for_human = client.post(f"/api/v1/workflow/continue/{thread_id}")
+    assert waiting_for_human.status_code == 409
+
+    workflow = client.app.state.content_graph
+    workflow._save(
+        thread_id,
+        {
+            **started["state"],
+            "review_decision": "approved",
+            "status": "generating_images",
+        },
+        ("generate_images",),
+    )
+
+    response = client.post(f"/api/v1/workflow/continue/{thread_id}")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["message"] == "工作流已从持久化检查点继续执行"

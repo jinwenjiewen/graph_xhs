@@ -15,6 +15,7 @@ from openai import (
 )
 
 from app.core.config import Settings, settings
+from app.graph.metrics import record_model_usage
 from app.services.volcengine_llm import LLMRateLimitError, LLMServiceError
 
 
@@ -33,7 +34,7 @@ class ArkImageService:
         missing = [
             name
             for name, value in {
-                "ARK_API_KEY（或 VOLCENGINE_API_KEY）": self._settings.ark_api_key,
+                "ARK_API_KEY": self._settings.ark_api_key,
                 "ARK_IMAGE_MODEL": self._settings.ark_image_model,
                 "ARK_BASE_URL": self._settings.ark_base_url,
             }.items()
@@ -62,6 +63,7 @@ class ArkImageService:
                     response_format="url",
                     extra_body={"watermark": self._settings.ark_image_watermark},
                 )
+                record_model_usage(response)
                 data: Any = getattr(response, "data", None)
                 url = getattr(data[0], "url", None) if isinstance(data, list) and data else None
                 if not isinstance(url, str) or not url.strip():

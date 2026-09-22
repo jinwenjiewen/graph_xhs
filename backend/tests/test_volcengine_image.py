@@ -11,7 +11,7 @@ from openai import RateLimitError
 
 from app.core.config import Settings
 from app.services.volcengine_image import ArkImageService
-from app.services.volcengine_llm import LLMRateLimitError
+from app.services.volcengine_llm import LLMRateLimitError, LLMServiceError
 
 
 class FakeImagesClient:
@@ -114,3 +114,20 @@ async def test_empty_image_url_is_rejected() -> None:
 
     with pytest.raises(RuntimeError, match="有效图片地址"):
         await service.generate_images(["内容运营流程"])
+
+
+def test_image_service_does_not_reuse_text_model_credentials() -> None:
+    """仅配置生文凭据时，文生图服务必须要求独立的 Ark 凭据。"""
+    service = ArkImageService(
+        Settings(
+            VOLCENGINE_API_KEY="text-api-key",
+            VOLCENGINE_MODEL="text-model",
+            VOLCENGINE_BASE_URL="https://text.example.test/v1",
+            ARK_API_KEY="",
+            ARK_BASE_URL="",
+            ARK_IMAGE_MODEL="",
+        )
+    )
+
+    with pytest.raises(LLMServiceError, match="ARK_API_KEY"):
+        service._get_client()

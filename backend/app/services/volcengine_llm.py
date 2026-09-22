@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from openai import APIConnectionError, APIStatusError, APITimeoutError, InternalServerError, RateLimitError
 
 from app.core.config import Settings, settings
+from app.graph.metrics import record_model_usage
 
 
 _WORKFLOW_ITEM_COUNT = 5
@@ -171,6 +172,7 @@ class VolcengineTextLLMService:
         for delay in (*_RETRY_DELAYS_SECONDS, None):
             try:
                 response = await self._get_client().ainvoke(messages)
+                record_model_usage(response)
                 text = self._response_text(response.content)
                 if not text:
                     raise ValueError("模型返回了空文本")

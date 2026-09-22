@@ -1,18 +1,18 @@
 # AI 内容运营助手
 
-一个带人工审核节点的 AI 内容生产工作台：后端使用 LangGraph 编排选题、撰稿、审核、配图流程，前端提供可视化操作界面。文本和图片能力通过火山引擎 Ark 的 OpenAI 兼容接口接入。
+一个带人工审核节点的 AI 内容生产工作台：后端使用 LangGraph 编排选题、撰稿、审核、视觉素材流程，前端提供可视化操作界面。文本和图片能力通过火山引擎 Ark 的 OpenAI 兼容接口接入。
 
 ## 功能
 
 - 根据内容方向生成候选选题，并由运营人员确认后继续。
 - 基于选题生成文章草稿；支持填写审核意见后重新生成。
-- 审核通过后提炼配图要点并生成图片。
+- 审核通过后由 `extract_visual_points` 生成视觉素材 Prompt，再由 `generate_images` 按 Prompt 生成当前的图片素材。
 - 按 `thread_id` 持久化工作流状态与历史快照，支持刷新后继续处理。
 - 提供单独的图片生成接口，以及 Vue 3 前端工作台。
 
 ## 技术栈
 
-- 后端：Python、FastAPI、LangGraph、SQLAlchemy、PostgreSQL
+- 后端：Python、FastAPI、LangGraph、Psycopg 3、PostgreSQL
 - AI 服务：火山引擎 Ark（文本与图像生成）
 - 前端：Vue 3、TypeScript、Vite
 
@@ -52,19 +52,26 @@ cd backend
 Copy-Item .env.example .env
 ```
 
-编辑 `backend/.env`，至少填写 `VOLCENGINE_API_KEY`；并按实际 PostgreSQL 账号修改 `DATABASE_URL`。`ARK_API_KEY` 为空时会复用 `VOLCENGINE_API_KEY`。
+编辑 `backend/.env`，分别填写生文模型和文生图模型的 URL、模型名与 API Key，并按实际 PostgreSQL 账号修改 `DATABASE_URL`。两套模型配置不会互相复用。
 
 ```env
-VOLCENGINE_API_KEY=你的火山引擎_Ark_API_Key
+# 生文模型
+VOLCENGINE_API_KEY=你的生文模型_API_Key
 VOLCENGINE_MODEL=doubao-seed-2-1-pro-260915
 VOLCENGINE_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 
-# 可选：不填时复用 VOLCENGINE_API_KEY
-ARK_API_KEY=
+# 文生图模型（必须单独填写）
+ARK_API_KEY=你的文生图模型_API_Key
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 ARK_IMAGE_MODEL=doubao-seedream-5-0-260128
 
-DATABASE_URL=postgresql+asyncpg://用户名:密码@localhost:5432/aicontent
+DATABASE_URL=postgresql://用户名:密码@localhost:5432/aicontent
+DATABASE_POOL_MIN_SIZE=1
+DATABASE_POOL_MAX_SIZE=5
 ```
+
+工作流状态和历史检查点通过 `psycopg_pool.AsyncConnectionPool` 写入 PostgreSQL。
+启动时预热至少 1 条连接，高并发时最多使用 5 条；可用上述两个环境变量按部署容量调整。
 
 > `.env` 已被 Git 忽略。请不要将真实 API Key 或数据库密码提交到仓库。
 
@@ -112,10 +119,12 @@ VITE_API_BASE_URL=https://your-api.example.com/api/v1
   → 生成文章草稿
   → 人工审核 ── 驳回 → 根据意见重写
        │
-       └── 通过 → 提炼配图要点 → 生成图片 → 完成
+       └── 通过 → extract_visual_points（生成 Prompt）
+                → generate_images（按 Prompt 生成视觉素材）→ 完成
 ```
 
 人工选择和审核时，工作流会在 PostgreSQL 检查点中暂停；后续请求用同一个 `thread_id` 恢复，所以可以安全地获取状态和历史记录。
+`generate_images` 当前接入 Ark 文生图服务；将来改用代码截图等视觉素材服务时，只需替换该节点使用的素材生成实现，并保持 Prompt 输入与 URL 输出契约。
 
 ## API 概览
 
@@ -124,7 +133,9 @@ VITE_API_BASE_URL=https://your-api.example.com/api/v1
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `POST` | `/workflow/start` | 输入内容方向，创建工作流并返回候选选题 |
+| `GET` | `/workflow/threads` | 按最近更新顺序列出可切换、可恢复的历史会话 |
 | `POST` | `/workflow/resume/{thread_id}` | 提交选题、通过审核或驳回意见 |
+| `POST` | `/workflow/continue/{thread_id}` | 从自动节点的持久化检查点继续执行 |
 | `GET` | `/workflow/state/{thread_id}` | 获取当前状态 |
 | `GET` | `/workflow/history/{thread_id}` | 获取状态快照历史 |
 | `POST` | `/images/generate` | 按提示词直接生成一张图片 |
@@ -155,6 +166,16 @@ curl -X POST http://127.0.0.1:8001/api/v1/workflow/resume/<thread_id> \
 ```
 
 驳回时将 `action` 设为 `reject`，并在 `data.review_feedback` 中提供修改意见。
+
+如果服务重启、网络中断或用户关闭页面时流程正在执行自动节点，可使用同一个
+`thread_id` 继续，不会重复人工决策或已完成的节点：
+
+```bash
+curl -X POST http://127.0.0.1:8001/api/v1/workflow/continue/<thread_id>
+```
+
+该接口只会继续自动节点；若流程停在选题或审核节点，仍须通过 `/resume/{thread_id}`
+提交对应的人工决策。
 
 ## 测试
 

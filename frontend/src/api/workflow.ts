@@ -11,6 +11,16 @@ export type WorkflowStatus =
   | 'completed'
   | string
 
+export interface NodeMetric {
+  node_name: string
+  started_at: string
+  duration_ms: number
+  model_call_count: number
+  input_tokens: number | null
+  output_tokens: number | null
+  total_tokens: number | null
+}
+
 export interface AgentState {
   topic_direction: string
   generated_topics?: string[]
@@ -21,6 +31,8 @@ export interface AgentState {
   image_urls?: string[]
   status: WorkflowStatus
   review_decision?: 'approved' | 'rejected'
+  /** 每次图节点执行后由服务端追加的真实性能与用量记录。 */
+  node_metrics?: NodeMetric[]
 }
 
 export interface WorkflowSnapshot {
@@ -37,6 +49,16 @@ export interface HistoryEntry extends WorkflowSnapshot {
   checkpoint_id?: string
   created_at: string
   metadata: Record<string, unknown>
+}
+
+export interface WorkflowThreadSummary {
+  thread_id: string
+  topic_direction: string
+  selected_topic?: string
+  status: WorkflowStatus
+  next: string[]
+  interrupted: boolean
+  updated_at: string
 }
 
 const apiBase = import.meta.env.VITE_API_BASE_URL || '/api/v1'
@@ -68,6 +90,16 @@ export function getWorkflowState(threadId: string) {
   return request<WorkflowSnapshot>(`/workflow/state/${threadId}`)
 }
 
+export function getWorkflowThreads() {
+  return request<{ threads: WorkflowThreadSummary[] }>('/workflow/threads')
+}
+
+export function deleteWorkflowThread(threadId: string) {
+  return request<{ thread_id: string; message: string }>(`/workflow/threads/${threadId}`, {
+    method: 'DELETE',
+  })
+}
+
 export function getWorkflowHistory(threadId: string) {
   return request<{ thread_id: string; history: HistoryEntry[] }>(`/workflow/history/${threadId}`)
 }
@@ -80,5 +112,11 @@ export function resumeWorkflow(
   return request<WorkflowSnapshot>(`/workflow/resume/${threadId}`, {
     method: 'POST',
     body: JSON.stringify({ action, data }),
+  })
+}
+
+export function continueWorkflow(threadId: string) {
+  return request<WorkflowSnapshot>(`/workflow/continue/${threadId}`, {
+    method: 'POST',
   })
 }

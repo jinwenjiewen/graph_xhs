@@ -18,16 +18,14 @@ import uvicorn
 from app.api.v1.images import router as image_router
 from app.api.v1.workflow import router as workflow_router
 from app.core.config import settings
-from app.core.db import close_db, init_db
-from app.graph.utils import close_checkpointer, setup_checkpointer
+from app.core.db import close_db, get_db_pool, init_db
+from app.graph.utils import setup_checkpointer
 from app.graph.workflow import build_workflow
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """在应用生命周期内管理数据库和 LangGraph 持久化资源。"""
-    checkpointer_context = None
-
     # Startup
     print(f"正在启动 {settings.app_name}...")
     try:
@@ -35,14 +33,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await init_db()
 
         print("初始化 LangGraph Checkpointer...")
-        checkpointer, checkpointer_context = await setup_checkpointer(settings.checkpointer_url)
+        checkpointer = await setup_checkpointer(get_db_pool())
         app.state.content_graph = build_workflow(checkpointer)
         print("Checkpointer 表结构已创建/验证")
         print(f"{settings.app_name} 启动成功!")
         print("API 文档: http://127.0.0.1:8001/docs")
+        print("前端网页: http://localhost:5173/")
     except Exception as exc:
         print(f"启动失败: {exc}")
-        await close_checkpointer(checkpointer_context)
         await close_db()
         raise RuntimeError(
             "无法连接本地 PostgreSQL。请先创建 aicontent 数据库，并检查 backend/.env 中的账号密码。"
@@ -53,10 +51,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # 关闭阶段：单个资源清理失败不应影响其余资源释放。
         print(f"正在关闭 {settings.app_name}...")
-        try:
-            await close_checkpointer(checkpointer_context)
-        except Exception as exc:
-            print(f"关闭 Checkpointer 时出错: {exc}")
         try:
             await close_db()
             print("资源已释放")

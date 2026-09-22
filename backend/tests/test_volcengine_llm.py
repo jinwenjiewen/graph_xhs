@@ -72,6 +72,23 @@ def _service_with(client: FakeChatClient) -> VolcengineTextLLMService:
     return service
 
 
+def test_text_service_does_not_reuse_image_model_credentials() -> None:
+    """仅配置文生图凭据时，生文服务必须要求独立的文本模型凭据。"""
+    service = VolcengineTextLLMService(
+        Settings(
+            ARK_API_KEY="image-api-key",
+            ARK_BASE_URL="https://image.example.test/v1",
+            ARK_IMAGE_MODEL="image-model",
+            VOLCENGINE_API_KEY="",
+            VOLCENGINE_MODEL="",
+            VOLCENGINE_BASE_URL="",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="VOLCENGINE_API_KEY"):
+        service._get_client()
+
+
 def test_parse_topics_accepts_json_code_fence() -> None:
     """即使模型违反格式约定包裹了代码块，仍能兼容解析。"""
     topics = VolcengineTextLLMService._parse_topics(

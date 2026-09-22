@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,21 +10,19 @@ class Settings(BaseSettings):
     """从 ``backend/.env`` 与环境变量加载的应用配置。"""
 
     app_name: str = "AI 内容运营助手"
-    database_url: str = "postgresql+asyncpg://postgres:root@localhost:5432/aicontent"
+    # 使用 psycopg 标准连接串；仍兼容旧的 postgresql+asyncpg 配置，见
+    # ``checkpointer_url`` 属性。
+    database_url: str = "postgresql://postgres:root@localhost:5432/aicontent"
     checkpoint_database_url: str | None = None
-    # LLM 连接信息统一由 backend/.env（或系统环境变量）提供。
+    database_pool_min_size: int = Field(default=1, validation_alias="DATABASE_POOL_MIN_SIZE")
+    database_pool_max_size: int = Field(default=5, validation_alias="DATABASE_POOL_MAX_SIZE")
+    # 生文和文生图模型必须使用各自独立的连接配置，均从 backend/.env 读取。
+    # 不提供任何密钥或上游地址默认值，防止误用、泄露或跨模型复用凭据。
     volcengine_api_key: str = Field(default="", validation_alias="VOLCENGINE_API_KEY")
     volcengine_model: str = Field(default="", validation_alias="VOLCENGINE_MODEL")
     volcengine_base_url: str = Field(default="", validation_alias="VOLCENGINE_BASE_URL")
-    # Ark 图像生成使用 OpenAI 兼容接口。若未单独配置 ARK_API_KEY，复用文字生成
-    # 使用的 VOLCENGINE_API_KEY，方便同一 Ark 账号下的模型共用密钥。
-    ark_api_key: str = Field(
-        default="", validation_alias=AliasChoices("ARK_API_KEY", "VOLCENGINE_API_KEY")
-    )
-    ark_base_url: str = Field(
-        default="https://ark.cn-beijing.volces.com/api/v3",
-        validation_alias=AliasChoices("ARK_BASE_URL", "VOLCENGINE_BASE_URL"),
-    )
+    ark_api_key: str = Field(default="", validation_alias="ARK_API_KEY")
+    ark_base_url: str = Field(default="", validation_alias="ARK_BASE_URL")
     ark_image_model: str = Field(
         default="doubao-seedream-5-0-260128", validation_alias="ARK_IMAGE_MODEL"
     )

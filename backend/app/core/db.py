@@ -1,35 +1,52 @@
-"""异步 SQLAlchemy 引擎与会话依赖。"""
+"""Psycopg 异步 PostgreSQL 连接池与生命周期管理。"""
 
 from collections.abc import AsyncGenerator
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import settings
 
 
-# pool_pre_ping 会在复用连接前探测其可用性，避免数据库重启后取到失效连接。
-engine = create_async_engine(settings.database_url, pool_pre_ping=True)
-# 禁用提交后的属性过期，接口层可在会话结束后安全读取本次查询得到的对象字段。
-AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+# 连接池在模块导入时保持关闭；由 FastAPI lifespan 在运行事件循环中显式打开。
+# Checkpointer 需要自动提交、字典行和禁用预处理语句，因而这些设置在整个池中统一。
+database_pool = AsyncConnectionPool(
+    conninfo=settings.checkpointer_url,
+    min_size=settings.database_pool_min_size,
+    max_size=settings.database_pool_max_size,
+    kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+    open=False,
+    name="content-postgres",
+)
 
 
-async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """提供一个不自动提交事务的异步 SQLAlchemy 会话。"""
-    # 提交或回滚由具体业务决定；依赖本身只负责按请求范围释放会话。
-    async with AsyncSessionLocal() as session:
-        yield session
+async def get_db_connection() -> AsyncGenerator[AsyncConnection, None]:
+    """为需要直接执行 PostgreSQL 语句的调用方借出一条连接。"""
+    async with database_pool.connection() as connection:
+        yield connection
+
+
+def get_db_pool() -> AsyncConnectionPool:
+    """返回应用唯一的连接池，供 LangGraph Checkpointer 复用。"""
+    return database_pool
 
 
 async def init_db() -> None:
-    """在应用启动时建立并验证 SQLAlchemy 数据库连接池。"""
-    async with engine.connect() as connection:
-        await connection.execute(text("SELECT 1"))
+    """打开连接池，建立最小连接数，并验证 PostgreSQL 可用。"""
+    await database_pool.open()
+    try:
+        await database_pool.wait()
+        async with database_pool.connection() as connection:
+            await connection.execute("SELECT 1")
+    except Exception:
+        await database_pool.close()
+        raise
 
 
 async def close_db() -> None:
-    """在应用关闭时释放所有 SQLAlchemy 连接。"""
-    await engine.dispose()
+    """在应用关闭时归还并关闭所有 PostgreSQL 连接。"""
+    await database_pool.close()
 
 
 # 为引用旧名称的代码保留兼容别名。

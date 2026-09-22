@@ -60,6 +60,21 @@ def _history_snapshot_payload(thread_id: str, snapshot: Any) -> dict[str, Any]:
     return payload
 
 
+def _thread_summary_payload(thread_id: str, snapshot: Any) -> dict[str, Any]:
+    """将线程的最新快照精简为会话列表所需的信息。"""
+    values = dict(snapshot.values)
+    next_nodes = list(snapshot.next)
+    return {
+        "thread_id": thread_id,
+        "topic_direction": values.get("topic_direction", ""),
+        "selected_topic": values.get("selected_topic"),
+        "status": values.get("status", "unknown"),
+        "next": next_nodes,
+        "interrupted": bool(next_nodes),
+        "updated_at": snapshot.created_at,
+    }
+
+
 def _resume_message(action: str, workflow_status: str) -> str:
     """根据人工操作及恢复后的状态生成供前端展示的成功提示。"""
     messages = {
@@ -69,6 +84,14 @@ def _resume_message(action: str, workflow_status: str) -> str:
     }
     # 保留兜底信息，避免未来增加工作流状态时返回空提示。
     return messages.get((action, workflow_status), "工作流已恢复执行")
+
+
+async def _run_until_pause_or_completion(graph: Any, config: dict[str, dict[str, str]]) -> Any:
+    """从当前检查点执行，直到下一处人工暂停或工作流结束。"""
+    # None 表示不注入新状态，直接从 PostgreSQL 保存的检查点恢复。
+    async for _ in graph.astream(None, config, stream_mode="updates"):
+        pass
+    return await graph.aget_state(config)
 
 
 async def _get_snapshot_or_404(request: Request, thread_id: str) -> tuple[Any, dict[str, dict[str, str]]]:
@@ -115,6 +138,75 @@ async def get_workflow_state(thread_id: str, request: Request) -> dict[str, Any]
     """获取最新持久化状态，供前端渲染使用。"""
     snapshot, _ = await _get_snapshot_or_404(request, thread_id)
     return _snapshot_payload(thread_id, snapshot)
+
+
+@router.get("/threads")
+async def list_workflow_threads(
+    request: Request,
+    limit: int = Query(default=30, ge=1, le=100, description="最多返回的历史会话数量"),
+) -> dict[str, Any]:
+    """按最近更新顺序列出可恢复的工作流线程。"""
+    graph = request.app.state.content_graph
+    checkpointer = getattr(graph, "checkpointer", None)
+    if checkpointer is None:
+        raise HTTPException(status_code=500, detail="工作流检查点存储尚未初始化")
+
+    latest_thread_ids: list[str] = []
+    seen_thread_ids: set[str] = set()
+    try:
+        # ``alist(None)`` 会按 checkpoint_id 从新到旧遍历所有线程的检查点。
+        # 每个 thread_id 仅取第一次出现的检查点，即该会话的最新状态。
+        # 不能在 ``alist`` 尚持有数据库游标时调用 ``aget_state``：两者共用连接池，
+        # 在真实 PostgreSQL 环境会导致状态读取等待游标释放。先收集 thread_id 并显式
+        # 关闭迭代器，再读取各会话的最新状态。
+        checkpoint_iterator = checkpointer.alist(None)
+        try:
+            async for checkpoint in checkpoint_iterator:
+                configurable = checkpoint.config.get("configurable", {})
+                thread_id = configurable.get("thread_id")
+                # 当前工作流只展示根命名空间，避免未来引入子图时重复展示同一会话。
+                if not isinstance(thread_id, str) or configurable.get("checkpoint_ns", "") != "":
+                    continue
+                if thread_id in seen_thread_ids:
+                    continue
+                seen_thread_ids.add(thread_id)
+                latest_thread_ids.append(thread_id)
+                if len(latest_thread_ids) >= limit:
+                    break
+        finally:
+            close_iterator = getattr(checkpoint_iterator, "aclose", None)
+            if close_iterator is not None:
+                await close_iterator()
+
+        threads: list[dict[str, Any]] = []
+        for thread_id in latest_thread_ids:
+            snapshot = await graph.aget_state(_config(thread_id))
+            if snapshot.values:
+                threads.append(_thread_summary_payload(thread_id, snapshot))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取历史会话列表失败: {exc}") from exc
+
+    return {"threads": threads}
+
+
+@router.delete("/threads/{thread_id}")
+async def delete_workflow_thread(thread_id: str, request: Request) -> dict[str, str]:
+    """删除一个历史会话及其全部 LangGraph 检查点。"""
+    # 先校验存在性，使删除不存在的会话保持与状态读取一致的 404 语义。
+    _, _ = await _get_snapshot_or_404(request, thread_id)
+    graph = request.app.state.content_graph
+    checkpointer = getattr(graph, "checkpointer", None)
+    if checkpointer is None:
+        raise HTTPException(status_code=500, detail="工作流检查点存储尚未初始化")
+
+    try:
+        # 使用 LangGraph Checkpointer 的官方删除方法，确保 checkpoints、blobs 和
+        # pending writes 会在同一线程范围内一并清理。
+        await checkpointer.adelete_thread(thread_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"删除历史会话失败: {exc}") from exc
+
+    return {"thread_id": thread_id, "message": "历史会话已删除"}
 
 
 @router.get("/history/{thread_id}")
@@ -186,10 +278,7 @@ async def resume_workflow(
     try:
         # 先写入人工输入，再从该检查点继续执行，保证中断前后的状态都可追溯。
         await graph.aupdate_state(config, update)
-        # 传入 None 表示从已持久化的检查点恢复，并在下一个人工中断点停下。
-        async for _ in graph.astream(None, config, stream_mode="updates"):
-            pass
-        updated_snapshot = await graph.aget_state(config)
+        updated_snapshot = await _run_until_pause_or_completion(graph, config)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except LLMRateLimitError as exc:
@@ -201,6 +290,34 @@ async def resume_workflow(
 
     response = _snapshot_payload(thread_id, updated_snapshot)
     response["message"] = _resume_message(payload.action, response["status"])
+    return response
+
+
+@router.post("/continue/{thread_id}")
+async def continue_workflow(thread_id: str, request: Request) -> dict[str, Any]:
+    """继续执行被中断的自动节点，不允许跳过人工决策。"""
+    graph = request.app.state.content_graph
+    snapshot, config = await _get_snapshot_or_404(request, thread_id)
+    next_nodes = set(snapshot.next)
+
+    if not next_nodes:
+        raise HTTPException(status_code=409, detail="当前工作流已完成，无需继续执行")
+    if {"human_selection_node", "human_review_node"} & next_nodes:
+        raise HTTPException(status_code=409, detail="当前工作流正在等待人工决策，请使用 resume 接口提交操作")
+
+    try:
+        updated_snapshot = await _run_until_pause_or_completion(graph, config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LLMRateLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    except LLMServiceError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"继续执行工作流失败: {exc}") from exc
+
+    response = _snapshot_payload(thread_id, updated_snapshot)
+    response["message"] = "工作流已从持久化检查点继续执行"
     return response
 # 1. /start 启动graph → plan_topics生成generated_topics → human_selection_node中断
 # 2. 前端调用 /resume action=select_topic，提交selected_topic

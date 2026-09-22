@@ -9,7 +9,9 @@ from app.services.volcengine_llm import VolcengineTextLLMService
 # 文字、配图要点与图片均使用生产模型。配图要点必须从已审核的正文提炼，
 # 不能使用固定文案，否则图片会与实际撰写内容脱节。
 _text_llm = VolcengineTextLLMService()
-_images = ArkImageService()
+# 视觉素材的具体生产方式可替换（如当前的文生图 API、未来的代码截图服务）；
+# 节点只依赖其“Prompt 列表 -> 素材 URL 列表”的契约。
+_visual_asset_generator = ArkImageService()
 
 
 async def plan_topics(state: AgentState) -> dict[str, object]:
@@ -41,24 +43,40 @@ async def human_review_node(state: AgentState) -> dict[str, object]:
     decision = state.get("review_decision")
     if decision not in {"approved", "rejected"}:
         raise ValueError("review_decision 必须为 approved 或 rejected")
-    return {"status": "review_approved" if decision == "approved" else "rewriting_draft"}
-    #approved提前视觉素材 rejected重写草稿
+    if decision == "rejected":
+        return {"status": "rewriting_draft"}
+
+    article = state.get("article_content", "").strip()
+    if not article:
+        raise ValueError("无法审核通过空文章")
+    # 审核动作是草稿版本的边界：此处复制后，视觉节点不再依赖可变草稿字段。
+    return {"approved_article_content": article, "status": "review_approved"}
 
 
 def route_after_review(state: AgentState) -> str:
     """审核后选择进入配图分支或回到重写循环。"""
     # 此处只负责路由；状态更新由 human_review_node 完成，便于职责分离。
-    return "extract_visuals" if state["review_decision"] == "approved" else "write_draft"
+    return "extract_visual_points" if state["review_decision"] == "approved" else "write_draft"
 
+
+
+async def extract_visual_points(state: AgentState) -> dict[str, object]:
+    """只从已审核正文提炼视觉素材 Prompt，不调用素材生成 API。"""
+    if state.get("review_decision") != "approved":
+        raise ValueError("只有审核通过的文章才能提炼配图")
+    article = state.get("approved_article_content", "")
+    if not article.strip():
+        raise ValueError("缺少已审核通过的文章，无法提炼配图")
+    prompts = await _text_llm.extract_visual_points(article)
+    return {"visual_points": prompts, "status": "generating_images"}
 
 
 async def extract_visuals(state: AgentState) -> dict[str, object]:
-    """从已通过审核的文章中提炼配图提示要点。"""
-    points = await _text_llm.extract_visual_points(state.get("article_content", ""))
-    return {"visual_points": points, "status": "generating_images"}
+    """兼容旧的 Python 调用方；新工作流节点使用 :func:`extract_visual_points`。"""
+    return await extract_visual_points(state)
 
 
 async def generate_images(state: AgentState) -> dict[str, object]:
-    """为已通过审核的文章调用 Ark 图像模型生成配图。"""
-    urls = await _images.generate_images(state.get("visual_points", []))
+    """按已提炼的 Prompt 调用当前视觉素材生成实现。"""
+    urls = await _visual_asset_generator.generate_images(state.get("visual_points", []))
     return {"image_urls": urls, "status": "completed"}
