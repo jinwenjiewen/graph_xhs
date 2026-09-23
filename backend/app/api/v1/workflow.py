@@ -8,9 +8,20 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
+from app.graph.snapshots import (
+    get_workflow_history as read_workflow_history,
+    get_workflow_snapshot,
+    topic_selection_snapshot,
+)
 from app.services.volcengine_llm import LLMRateLimitError, LLMServiceError
 
 router = APIRouter(prefix="/workflow", tags=["workflow"])
+
+# 新名称与升级前持久化工作流的名称同时视作人工中断点。这样部署升级不会让
+# 已暂停会话绕过用户输入，也不会强迫用户放弃正在进行的内容任务。
+_HUMAN_SELECT_NODES = frozenset({"human_select_node", "human_selection_node"})
+_HUMAN_REVIEW_NODES = frozenset({"human_review_node"})
+_HUMAN_INTERRUPT_NODES = _HUMAN_SELECT_NODES | _HUMAN_REVIEW_NODES
 
 
 class StartWorkflowRequest(BaseModel):
@@ -41,7 +52,8 @@ def _snapshot_payload(thread_id: str, snapshot: Any) -> dict[str, Any]:
         "thread_id": thread_id,        # 会话线程ID
         "status": values.get("status", "unknown"), # 当前业务状态
         "next": next_nodes,            # 下一步将要执行的节点列表
-        "interrupted": bool(next_nodes), # 是否暂停（关键点）
+        "interrupted": bool(set(next_nodes) & _HUMAN_INTERRUPT_NODES), # 是否正在等待人工输入
+        "awaiting_human_input": bool(set(next_nodes) & _HUMAN_INTERRUPT_NODES),
         "state": values,               #完整Agent状态数据
     }
 
@@ -53,6 +65,7 @@ def _history_snapshot_payload(thread_id: str, snapshot: Any) -> dict[str, Any]:
     payload.update(
         {
             "checkpoint_id": configurable.get("checkpoint_id"),
+            "checkpoint_ns": configurable.get("checkpoint_ns", ""),
             "created_at": snapshot.created_at,
             "metadata": dict(snapshot.metadata or {}),
         }
@@ -70,7 +83,8 @@ def _thread_summary_payload(thread_id: str, snapshot: Any) -> dict[str, Any]:
         "selected_topic": values.get("selected_topic"),
         "status": values.get("status", "unknown"),
         "next": next_nodes,
-        "interrupted": bool(next_nodes),
+        "interrupted": bool(set(next_nodes) & _HUMAN_INTERRUPT_NODES),
+        "awaiting_human_input": bool(set(next_nodes) & _HUMAN_INTERRUPT_NODES),
         "updated_at": snapshot.created_at,
     }
 
@@ -91,14 +105,14 @@ async def _run_until_pause_or_completion(graph: Any, config: dict[str, dict[str,
     # None 表示不注入新状态，直接从 PostgreSQL 保存的检查点恢复。
     async for _ in graph.astream(None, config, stream_mode="updates"):
         pass
-    return await graph.aget_state(config)
+    return await get_workflow_snapshot(graph, config)
 
 
 async def _get_snapshot_or_404(request: Request, thread_id: str) -> tuple[Any, dict[str, dict[str, str]]]:
     """读取已有持久化线程；不存在时转换为 HTTP 404。"""
     graph = request.app.state.content_graph
     config = _config(thread_id)
-    snapshot = await graph.aget_state(config)   #`aget_state`读取当前线程的状态快照
+    snapshot = await get_workflow_snapshot(graph, config)
     if not snapshot.values:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到该 thread_id")
     return snapshot, config
@@ -117,7 +131,7 @@ async def start_workflow(payload: StartWorkflowRequest, request: Request) -> dic
             config,
         )
 
-        snapshot = await graph.aget_state(config)   #`aget_state`读取当前线程的状态快照
+        snapshot = await get_workflow_snapshot(graph, config)
 
     except LLMRateLimitError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
@@ -164,8 +178,9 @@ async def list_workflow_threads(
             async for checkpoint in checkpoint_iterator:
                 configurable = checkpoint.config.get("configurable", {})
                 thread_id = configurable.get("thread_id")
-                # 当前工作流只展示根命名空间，避免未来引入子图时重复展示同一会话。
-                if not isinstance(thread_id, str) or configurable.get("checkpoint_ns", "") != "":
+                # 按父子图任一最新检查点排序，再按 thread_id 去重。
+                # 后续仍读取根图快照，子图不会被展示为独立会话。
+                if not isinstance(thread_id, str):
                     continue
                 if thread_id in seen_thread_ids:
                     continue
@@ -180,7 +195,7 @@ async def list_workflow_threads(
 
         threads: list[dict[str, Any]] = []
         for thread_id in latest_thread_ids:
-            snapshot = await graph.aget_state(_config(thread_id))
+            snapshot = await get_workflow_snapshot(graph, _config(thread_id))
             if snapshot.values:
                 threads.append(_thread_summary_payload(thread_id, snapshot))
     except Exception as exc:
@@ -220,15 +235,11 @@ async def get_workflow_history(
     _, config = await _get_snapshot_or_404(request, thread_id)
 
     try:
-        snapshots = [
-            snapshot
-            async for snapshot in graph.aget_state_history(config, limit=limit)
-        ]
+        snapshots = await read_workflow_history(graph, config, limit=limit)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取工作流历史失败: {exc}") from exc
 
-    # LangGraph 按最近优先返回，前端时间线使用最早优先的顺序。
-    snapshots.reverse()
+    # 父子图历史已按时间合并为最早优先，保留选题过程的独立检查点。
     return {
         "thread_id": thread_id,
         "history": [_history_snapshot_payload(thread_id, snapshot) for snapshot in snapshots],
@@ -243,11 +254,12 @@ async def resume_workflow(
     graph = request.app.state.content_graph
     snapshot, config = await _get_snapshot_or_404(request, thread_id)
     next_nodes = set(snapshot.next)         #拿到**待执行节点集合**
+    update_config = config
 
     if payload.action == "select_topic":                    # 分析是哪个 查看方向（select_topic）action: Literal["select_topic", "approve", "reject"]
         # 仅允许在选题中断点提交选题，防止用过期请求覆盖后续状态。
-        # 选题阶段，对应节点 human_selection_node
-        if "human_selection_node" not in next_nodes:        #要求当前必须停在
+        # 选题阶段对应 canonical human_select_node，且兼容旧 checkpoint 的节点名。
+        if not _HUMAN_SELECT_NODES & next_nodes:        #要求当前必须停在
             raise HTTPException(status_code=409, detail="当前工作流并未等待选题")
         selected_topic = payload.data.get("selected_topic", payload.data.get("topic"))
         candidates = snapshot.values.get("generated_topics", [])
@@ -258,26 +270,35 @@ async def resume_workflow(
                 detail="data.selected_topic 必须是 generated_topics 中的一个选题",
             )
         update: dict[str, Any] = {"selected_topic": selected_topic, "status": "topic_selected"}
+        child = topic_selection_snapshot(snapshot)
+        if child is not None:
+            # 子图暂停时尚未向父图输出状态，人工选择必须写入子图命名空间。
+            update_config = child.config
     else:
         # approve/reject 都只能在审稿中断点处理。
         if "human_review_node" not in next_nodes:       #要求当前必须停在
             # 要求当前必须停在 human_review_node 这个待执行节点
             raise HTTPException(status_code=409, detail="当前工作流并未等待审稿")
-        feedback = payload.data.get("review_feedback", payload.data.get("feedback", ""))
+        feedback = payload.data.get(
+            "human_feedback",
+            payload.data.get("review_feedback", payload.data.get("feedback", "")),
+        )
         # 驳回强制要求填写意见
         if not isinstance(feedback, str):
-            raise HTTPException(status_code=422, detail="data.review_feedback 必须为字符串")
+            raise HTTPException(status_code=422, detail="data.human_feedback 必须为字符串")
         if payload.action == "reject" and not feedback.strip():
-            raise HTTPException(status_code=422, detail="驳回时必须提供 data.review_feedback")     #审核反馈意见（review_feedback）
+            raise HTTPException(status_code=422, detail="驳回时必须提供 data.human_feedback")
         update = {
             "review_decision": "approved" if payload.action == "approve" else "rejected",
+            "human_feedback": feedback,
+            # 保留旧字段，保证升级前的自定义节点实现仍能读取审核意见。
             "review_feedback": feedback,
             "status": "review_submitted",   #审核已提交
         }
 
     try:
         # 先写入人工输入，再从该检查点继续执行，保证中断前后的状态都可追溯。
-        await graph.aupdate_state(config, update)
+        await graph.aupdate_state(update_config, update)
         updated_snapshot = await _run_until_pause_or_completion(graph, config)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -302,7 +323,7 @@ async def continue_workflow(thread_id: str, request: Request) -> dict[str, Any]:
 
     if not next_nodes:
         raise HTTPException(status_code=409, detail="当前工作流已完成，无需继续执行")
-    if {"human_selection_node", "human_review_node"} & next_nodes:
+    if _HUMAN_INTERRUPT_NODES & next_nodes:
         raise HTTPException(status_code=409, detail="当前工作流正在等待人工决策，请使用 resume 接口提交操作")
 
     try:
@@ -319,10 +340,10 @@ async def continue_workflow(thread_id: str, request: Request) -> dict[str, Any]:
     response = _snapshot_payload(thread_id, updated_snapshot)
     response["message"] = "工作流已从持久化检查点继续执行"
     return response
-# 1. /start 启动graph → plan_topics生成generated_topics → human_selection_node中断
+# 1. /start 进入 topic_selection 子图 → plan_topics 生成候选题 → human_select_node 中断
 # 2. 前端调用 /resume action=select_topic，提交selected_topic
-#     ✅ aupdate_state写入选题 → astream跑图 → 进入writing_draft节点生成草稿
-#     ✅ 跑完writing_draft → 走到 human_review_node，触发interrupt暂停
+#     ✅ aupdate_state 写入子图选题 → 从根图 astream 续跑 → generate_draft 生成草稿
+#     ✅ 跑完generate_draft → 走到 human_review_node，触发interrupt暂停
 # 3. 前端展示草稿，调用/resume action=approve / reject
 #     ✅ 如果approve：写入review_decision=approved，继续执行，流程结束
-#     ✅ 如果reject：写入review_decision=rejected + review_feedback，分支路由回到writing_draft重写草稿
+#     ✅ 如果reject：写入review_decision=rejected + human_feedback，分支路由回到generate_draft重写草稿

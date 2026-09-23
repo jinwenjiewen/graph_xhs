@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     ark_image_watermark: bool = Field(
         default=False, validation_alias="ARK_IMAGE_WATERMARK"
     )
+    ark_image_max_concurrency: int = Field(
+        default=3,
+        ge=1,
+        validation_alias="ARK_IMAGE_MAX_CONCURRENCY",
+    )
 
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parents[2] / ".env",

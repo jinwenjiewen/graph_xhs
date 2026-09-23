@@ -7,9 +7,11 @@
 - **人机协作工作流**：AI 生成候选选题和文章草稿；人工确认选题、审核通过或填写意见驳回重写。
 - **持久化与恢复**：每个工作流使用独立的 `thread_id`，状态、历史快照与待执行节点均保存到 PostgreSQL；服务重启或页面关闭后仍可继续。
 - **会话管理**：查看、切换和删除历史会话；删除会同时清理该会话的检查点数据。
-- **视觉素材生成**：审核通过后提炼视觉提示词，再调用火山引擎 Ark 文生图服务生成图片 URL。
+- **视觉素材生成**：审核通过后从最终正文提炼 3–5 条关键知识点与配图 Prompt，再受控并行调用火山引擎 Ark 文生图服务；前端将知识点叠加展示在对应图片上。
 - **性能可观测性**：记录每个图节点的耗时、模型调用次数和上游返回的真实 Token 用量；缺少上游用量时明确标记为未知，不做估算。
 - **前端控制台**：展示工作流进度、候选选题、草稿、审核操作、历史快照、生成图片和节点指标。
+
+选题、正文、知识点和图片均来自已配置的真实 Ark 模型，会话与检查点保存到 PostgreSQL。缺少配置或上游请求失败时，接口返回错误。
 
 ## 架构
 
@@ -31,15 +33,39 @@ FastAPI（:8001）
 
 ```text
 输入内容方向
-  → 生成候选选题
-  → 【人工】确认选题
+  → topic_selection 选题子图
+       生成候选选题 → 【人工】确认选题 → 返回已确认选题
   → 生成文章草稿
   → 【人工】审核内容 ── 驳回 → 按意见重写 → 再次审核
        │
-       └── 通过 → 提炼视觉提示词 → 生成视觉素材 → 完成
+       └── 通过 → 提炼关键知识点 + 配图 Prompt → 并行生成视觉素材 → 完成
 ```
 
 两个人工节点会主动暂停工作流。其余自动节点可从已持久化的检查点继续执行，不会跳过人工决策。
+
+选题由 `backend/app/graph/subgraphs/topic_selection.py` 中的
+`build_topic_selection_subgraph()` 封装，内部路径为
+`START → plan_topics → human_select_node → END`。主图通过
+`START → topic_selection → generate_draft` 组合它；子图使用独立的
+`TopicSelectionState`，只共享方向、候选题、已选题、状态和节点指标。
+子图默认继承主图的 PostgreSQL 持久化器，也可传入持久化器独立运行。
+
+人工选题的暂停点位于子图内部。API 读取嵌套检查点并将其投影为原有的
+`state` 和 `next: ["human_select_node"]`，提交选题时先更新子图检查点，再恢复主图。
+前端请求格式不变；历史接口按时间合并父子图快照，使用 `checkpoint_ns` 区分命名空间。
+
+| 节点 | 职责 |
+| --- | --- |
+| `topic_selection` | 可复用选题子图，完成后将选题结果交给撰稿节点。 |
+| `plan_topics`（子图内） | 按 `topic_direction` 生成 3–5 个技术干货选题。 |
+| `human_select_node`（子图内） | 选题中断点，等待 API 写入子图的 `selected_topic`。 |
+| `generate_draft` | 按选题写技术长文；有 `human_feedback` 时按意见重写。 |
+| `human_review_node` | 草稿审核中断点，等待通过或修改意见。 |
+| `extract_visual_points` | 只从审核冻结的 `final_content` 提炼 3–5 条图片文字与配图 Prompt。 |
+| `generate_images` | 受并发上限保护地并行生成技术配图，且按知识点顺序返回。 |
+
+升级前平面图的 `plan_topics`、`human_select_node`、`human_selection_node`、`write_draft`
+和旧状态字段仍保留兼容，以便已暂停会话恢复；新会话统一使用选题子图。
 
 ## 技术栈
 
@@ -105,6 +131,8 @@ ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 ARK_IMAGE_MODEL=doubao-seedream-5-0-260128
 ARK_IMAGE_SIZE=2K
 ARK_IMAGE_WATERMARK=false
+# 单个后端实例中 Ark 图片请求的最大并发数
+ARK_IMAGE_MAX_CONCURRENCY=3
 
 # PostgreSQL：使用 psycopg 连接串，不要使用 SQLAlchemy 的 asyncpg 方言
 DATABASE_URL=postgresql://用户名:密码@localhost:5432/aicontent
@@ -112,7 +140,7 @@ DATABASE_POOL_MIN_SIZE=1
 DATABASE_POOL_MAX_SIZE=5
 ```
 
-`DATABASE_POOL_MIN_SIZE` 是启动时预热的最小连接数，`DATABASE_POOL_MAX_SIZE` 是连接池上限。LangGraph 检查点和数据库访问共用这个连接池。
+`DATABASE_POOL_MIN_SIZE` 是启动时预热的最小连接数，`DATABASE_POOL_MAX_SIZE` 是连接池上限。LangGraph 检查点和数据库访问共用这个连接池。`ARK_IMAGE_MAX_CONCURRENCY` 控制同一后端实例发往 Ark 的并发绘图请求，默认 3；提高它可能增加限流和成本风险。
 
 > `backend/.env` 已被 Git 忽略。仓库只保留 [`.env.example`](backend/.env.example)，请勿提交真实 API Key、数据库密码或生产地址。
 
@@ -191,7 +219,7 @@ curl -X POST http://127.0.0.1:8001/api/v1/workflow/resume/<thread_id> \
   -d '{"action":"approve","data":{}}'
 ```
 
-审核驳回时使用 `action: "reject"`，并传入非空的 `data.review_feedback`。如果进程在自动节点中断，可调用以下接口恢复：
+审核驳回时使用 `action: "reject"`，并传入非空的 `data.human_feedback`。为兼容旧客户端，`data.review_feedback` 仍可使用。如果进程在自动节点中断，可调用以下接口恢复：
 
 ```bash
 curl -X POST http://127.0.0.1:8001/api/v1/workflow/continue/<thread_id>
@@ -205,12 +233,33 @@ curl -X POST http://127.0.0.1:8001/api/v1/workflow/continue/<thread_id>
 
 ## 测试
 
-后端测试会注入内存工作流与假模型服务，不需要 PostgreSQL 或真实密钥：
+选题子图的离线回归测试使用真实 LangGraph 内存检查点，替换外部模型调用，验证人工暂停、
+跨图实例恢复、接口兼容、历史快照、指标及旧检查点续跑：
+
+```powershell
+pytest backend/tests/test_topic_selection_subgraph.py -q
+```
+
+后端集成测试通过 HTTP 连接运行中的真实服务，使用实际的 PostgreSQL 与 Ark 模型。先按快速开始配置 `backend/.env` 并启动后端，再在另一个终端安装测试依赖：
 
 ```powershell
 cd backend
-pytest
+pip install -r requirements-test.txt
 ```
+
+只检查后端健康状态及数据库会话读取：
+
+```powershell
+pytest --run-live -m "not generation" -q
+```
+
+验证选题、初稿、按意见重写、审核通过、配图及持久化完整流程：
+
+```powershell
+pytest --run-live -s
+```
+
+完整测试会消耗真实模型配额，并在数据库中保留新生成的会话；终端会输出 `thread_id`。默认连接 `http://127.0.0.1:8001`，可通过 `LIVE_API_BASE_URL` 指定后端根地址（不含 `/api/v1`），通过 `LIVE_API_TIMEOUT_SECONDS` 调整请求超时（默认 600 秒），通过 `LIVE_TOPIC_DIRECTION` 指定实际生成方向。普通 `pytest` 会跳过真实服务测试，必须显式指定 `--run-live` 才会执行。
 
 前端类型检查与生产构建：
 

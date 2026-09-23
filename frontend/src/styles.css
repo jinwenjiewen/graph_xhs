@@ -133,9 +133,10 @@ input::placeholder, textarea::placeholder { color: #adb6c5; }
 .visual-number { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; color: #5363c7; background: #e9edff; font-size: 11px; font-weight: 700; }
 .visual-list p { margin: 1px 0 0; color: #60708b; font-size: 12px; line-height: 1.6; }
 .image-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 19px; }
-.image-grid a { display: block; overflow: hidden; border-radius: 9px; color: #62718a; background: #f3f5f8; font-size: 11px; text-decoration: none; }
+.image-grid a { position: relative; display: block; overflow: hidden; border-radius: 9px; color: #62718a; background: #f3f5f8; font-size: 11px; text-decoration: none; }
 .image-grid img { display: block; width: 100%; aspect-ratio: 1.5; object-fit: cover; transition: transform .25s; }
-.image-grid a > span { display: block; padding: 8px 10px; }
+.image-grid .image-overlay { position: absolute; top: 10px; left: 10px; right: 10px; display: -webkit-box; overflow: hidden; padding: 6px 8px; border-radius: 6px; color: #fff; background: rgb(25 35 53 / 78%); font-size: 12px; font-weight: 650; line-height: 1.35; -webkit-box-orient: vertical; -webkit-line-clamp: 2; backdrop-filter: blur(3px); }
+.image-grid .image-label { display: block; padding: 8px 10px; }
 .image-grid a:hover img { transform: scale(1.025); }
 .snapshot-card { scroll-margin-top: 20px; border-color: #dce2ff; background: #fbfcff; }
 .snapshot-card .card-copy { margin-bottom: 18px; }

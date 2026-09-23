@@ -20,7 +20,9 @@ class GenerateImageRequest(BaseModel):
         min_length=1,
         max_length=4_000,
         description="用于生成图片的提示词",
-        examples=["未来感数据中心，蓝紫色霓虹灯，电影级光影，细节丰富"],
+        # examples=["未来感数据中心，蓝紫色霓虹灯，电影级光影，细节丰富"],
+        # examples=["奶油色背景，极简光影，细节丰富，ins风"],
+
     )
 
 

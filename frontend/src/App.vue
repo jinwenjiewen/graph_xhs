@@ -26,7 +26,8 @@ interface FlowStep {
 }
 
 const STORAGE_KEY = 'content-agent-thread-id'
-const WORKFLOW_ITEM_COUNT = 5
+const MIN_WORKFLOW_ITEM_COUNT = 3
+const MAX_WORKFLOW_ITEM_COUNT = 5
 const topicDirection = ref('')
 const workflow = ref<WorkflowSnapshot | null>(null)
 const history = ref<HistoryEntry[]>([])
@@ -56,14 +57,20 @@ const imageUrls = computed(() => currentState.value?.image_urls || [])
 const viewedGeneratedTopics = computed(() => state.value?.generated_topics || [])
 const viewedVisualPoints = computed(() => state.value?.visual_points || [])
 const viewedImageUrls = computed(() => state.value?.image_urls || [])
-const isWaitingTopic = computed(() => workflow.value?.next.includes('human_selection_node') ?? false)
+const isHumanSelectNode = (nodeName?: string) => nodeName === 'human_select_node' || nodeName === 'human_selection_node'
+const isWaitingTopic = computed(() => workflow.value?.next.some(isHumanSelectNode) ?? false)
 const isWaitingReview = computed(() => workflow.value?.next.includes('human_review_node') ?? false)
 const isCompleted = computed(() => workflow.value?.status === 'completed')
 const isViewingStep = computed(() => viewedSnapshot.value !== null)
 const canContinue = computed(() => Boolean(
   workflow.value?.next.length && !isWaitingTopic.value && !isWaitingReview.value,
 ))
-const isExpectedCount = (items: unknown[]) => items.length === WORKFLOW_ITEM_COUNT
+const hasWorkflowItemCount = (items: unknown[]) => (
+  items.length >= MIN_WORKFLOW_ITEM_COUNT && items.length <= MAX_WORKFLOW_ITEM_COUNT
+)
+const hasCompleteImageSet = (points: unknown[], urls: unknown[]) => (
+  hasWorkflowItemCount(points) && urls.length === points.length
+)
 
 interface NodeMetricRow extends NodeMetric {
   runNumber: number
@@ -81,11 +88,13 @@ const nodeMetricRows = computed<NodeMetricRow[]>(() => {
 function getNodeLabel(nodeName: string) {
   const labels: Record<string, string> = {
     plan_topics: '生成选题',
+    human_select_node: '确认选题',
     human_selection_node: '确认选题',
+    generate_draft: '撰写草稿',
     write_draft: '撰写草稿',
     human_review_node: '审核内容',
-    extract_visual_points: '生成 Prompt',
-    extract_visuals: '生成 Prompt（兼容节点）',
+    extract_visual_points: '提炼知识点',
+    extract_visuals: '提炼知识点（兼容节点）',
     generate_images: '生成视觉素材',
   }
   return labels[nodeName] || nodeName
@@ -140,21 +149,21 @@ function findStepSnapshot(stepKey: string): HistoryEntry | null {
 const flowSteps = computed<FlowStep[]>(() => {
   const current = workflow.value
   const agentState = currentState.value
-  const hasTopics = isExpectedCount(generatedTopics.value)
+  const hasTopics = hasWorkflowItemCount(generatedTopics.value)
   const hasSelected = Boolean(agentState?.selected_topic)
   const hasDraft = Boolean(agentState?.article_content)
   const hasDecision = Boolean(agentState?.review_decision)
-  const hasVisuals = isExpectedCount(visualPoints.value)
-  const hasImages = isExpectedCount(imageUrls.value)
+  const hasVisuals = hasWorkflowItemCount(visualPoints.value)
+  const hasImages = hasCompleteImageSet(visualPoints.value, imageUrls.value)
   const currentNode = current?.next[0]
 
   return [
     { key: 'topics', title: '生成选题', description: '规划 Agent', state: hasTopics ? 'completed' : current ? 'current' : 'pending', snapshot: findStepSnapshot('topics') },
-    { key: 'selection', title: '确认选题', description: '人工决策', state: hasSelected ? 'completed' : currentNode === 'human_selection_node' ? 'current' : 'pending', snapshot: findStepSnapshot('selection') },
+    { key: 'selection', title: '确认选题', description: '人工决策', state: hasSelected ? 'completed' : isHumanSelectNode(currentNode) ? 'current' : 'pending', snapshot: findStepSnapshot('selection') },
     { key: 'draft', title: '撰写草稿', description: '写作 Agent', state: hasDraft ? 'completed' : hasSelected ? 'current' : 'pending', snapshot: findStepSnapshot('draft') },
     { key: 'review', title: '审核内容', description: '人工决策', state: hasDecision && !isWaitingReview.value ? 'completed' : currentNode === 'human_review_node' ? 'current' : 'pending', snapshot: findStepSnapshot('review') },
-    { key: 'prompts', title: '生成 Prompt', description: '视觉规划 Agent', state: hasVisuals ? 'completed' : hasDecision && agentState?.review_decision === 'approved' ? 'current' : 'pending', snapshot: findStepSnapshot('prompts') },
-    { key: 'images', title: '生成视觉素材', description: '素材生成 Agent', state: hasImages ? 'completed' : hasVisuals ? 'current' : 'pending', snapshot: findStepSnapshot('images') },
+    { key: 'prompts', title: '提炼知识点', description: '视觉规划 Agent', state: hasVisuals ? 'completed' : hasDecision && agentState?.review_decision === 'approved' ? 'current' : 'pending', snapshot: findStepSnapshot('prompts') },
+    { key: 'images', title: '生成视觉素材', description: '并行绘图 Agent', state: hasImages ? 'completed' : hasVisuals ? 'current' : 'pending', snapshot: findStepSnapshot('images') },
   ]
 })
 
@@ -344,7 +353,7 @@ async function takeAction(action: 'select_topic' | 'approve' | 'reject', value?:
   try {
     const data: Record<string, string> = {}
     if (action === 'select_topic') data.selected_topic = value || ''
-    if (action === 'reject') data.review_feedback = feedback.value.trim()
+    if (action === 'reject') data.human_feedback = feedback.value.trim()
     const snapshot = await resumeWorkflow(threadId.value, action, data)
     clearStepPreview()
     applySnapshot(snapshot)
@@ -487,7 +496,7 @@ onBeforeUnmount(() => {
           <p class="eyebrow">01 · 创建任务</p>
           <h2>你想写什么内容？</h2>
         </div>
-        <span class="subtle">规划 Agent 会给出 {{ WORKFLOW_ITEM_COUNT }} 个可选选题</span>
+        <span class="subtle">规划 Agent 会给出 {{ MIN_WORKFLOW_ITEM_COUNT }}–{{ MAX_WORKFLOW_ITEM_COUNT }} 个可选选题</span>
       </div>
       <form class="task-form" @submit.prevent="createWorkflow">
         <label for="topic-direction">内容方向</label>
@@ -607,9 +616,9 @@ onBeforeUnmount(() => {
                 <dt>审核决定</dt>
                 <dd>{{ state.review_decision === 'approved' ? '已通过' : '已驳回' }}</dd>
               </div>
-              <div v-if="state?.review_feedback">
+              <div v-if="state?.human_feedback || state?.review_feedback">
                 <dt>审核意见</dt>
-                <dd>{{ state.review_feedback }}</dd>
+                <dd>{{ state.human_feedback || state.review_feedback }}</dd>
               </div>
             </dl>
           </article>
@@ -637,7 +646,7 @@ onBeforeUnmount(() => {
               </div>
               <span class="waiting-label">已暂停</span>
             </div>
-            <p class="card-copy">规划 Agent 已完成分析，已生成 {{ generatedTopics.length }} / {{ WORKFLOW_ITEM_COUNT }} 个候选。选定方向后，写作 Agent 会继续生成文章草稿。</p>
+            <p class="card-copy">规划 Agent 已完成分析，已生成 {{ generatedTopics.length }} 个候选。选定方向后，写作 Agent 会继续生成文章草稿。</p>
             <div class="topic-list">
               <button v-for="(topic, index) in generatedTopics" :key="`${index}-${topic}`" class="topic-option" type="button" :disabled="actionLoading" @click="takeAction('select_topic', topic)">
                 <span class="topic-number">{{ index + 1 }}</span>
@@ -668,7 +677,7 @@ onBeforeUnmount(() => {
               </div>
               <span class="waiting-label">已暂停</span>
             </div>
-            <p class="card-copy">通过后会先生成 5 条视觉 Prompt，再按 Prompt 生成视觉素材；驳回时会将你的意见交给写作 Agent 重写。</p>
+            <p class="card-copy">通过后会从最终正文提炼 3–5 条关键知识点与技术配图 Prompt，再并行生成视觉素材；驳回时会将你的意见交给写作 Agent 重写。</p>
             <label class="feedback-label" for="feedback">修改意见 <em>驳回时必填</em></label>
             <textarea id="feedback" v-model="feedback" maxlength="1000" placeholder="例如：语气更轻松一些，并补充一个具体案例" :disabled="actionLoading"></textarea>
             <div class="review-actions">
@@ -680,10 +689,10 @@ onBeforeUnmount(() => {
           <article v-if="viewedVisualPoints.length" class="visual-card card">
             <div class="card-title-row">
               <div>
-                <p class="eyebrow">视觉 Prompt</p>
-                <h2>已生成视觉素材提示词</h2>
+                <p class="eyebrow">图片文字</p>
+                <h2>已提炼的关键知识点</h2>
               </div>
-              <span class="neutral-label">{{ viewedVisualPoints.length }} / {{ WORKFLOW_ITEM_COUNT }} 条</span>
+              <span class="neutral-label">{{ viewedVisualPoints.length }} 条</span>
             </div>
             <ol class="visual-list">
               <li v-for="(point, index) in viewedVisualPoints" :key="`${index}-${point}`">
@@ -699,14 +708,15 @@ onBeforeUnmount(() => {
                 <p class="eyebrow">生成结果</p>
                 <h2>文章视觉素材</h2>
               </div>
-              <span :class="isExpectedCount(viewedImageUrls) ? 'complete-label' : 'neutral-label'">
-                {{ isExpectedCount(viewedImageUrls) ? '已完成' : '已生成' }} {{ viewedImageUrls.length }} / {{ WORKFLOW_ITEM_COUNT }} 张
+              <span :class="hasCompleteImageSet(viewedVisualPoints, viewedImageUrls) ? 'complete-label' : 'neutral-label'">
+                {{ hasCompleteImageSet(viewedVisualPoints, viewedImageUrls) ? '已完成' : '已生成' }} {{ viewedImageUrls.length }} 张
               </span>
             </div>
             <div class="image-grid">
               <a v-for="(url, index) in viewedImageUrls" :key="`${index}-${url}`" :href="url" target="_blank" rel="noreferrer" :aria-label="`查看${imageLabel(index)}`">
                 <img :src="url" :alt="`文章${imageLabel(index)}`" />
-                <span>{{ imageLabel(index) }}</span>
+                <span v-if="viewedVisualPoints[index]" class="image-overlay">{{ viewedVisualPoints[index] }}</span>
+                <span class="image-label">{{ imageLabel(index) }}</span>
               </a>
             </div>
           </article>

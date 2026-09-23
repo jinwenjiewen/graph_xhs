@@ -28,9 +28,14 @@ class ArkImageService:
     def __init__(self, app_settings: Settings = settings) -> None:
         self._settings = app_settings
         self._client: AsyncOpenAI | None = None
+        # 服务实例会在多个工作流调用之间复用；因此限流器也必须复用，
+        # 才能限制所有同一 Ark 客户端发出的同时请求数。
+        self._generation_semaphore = asyncio.Semaphore(
+            self._settings.ark_image_max_concurrency
+        )
 
     def _get_client(self) -> AsyncOpenAI:
-        """延迟创建客户端，使未配置密钥时应用和测试仍可正常导入。"""
+        """首次图片生成时校验真实服务配置并创建客户端。"""
         missing = [
             name
             for name, value in {
@@ -84,11 +89,39 @@ class ArkImageService:
         raise AssertionError("图像生成重试循环不应执行到这里")
 
     async def generate_images(self, visual_points: list[str]) -> list[str]:
-        """为每个非空视觉要点依次生成一张图片，返回 Ark 的 URL 列表。"""
+        """为每个非空视觉要点并行生成图片，并保持输入顺序返回 URL。"""
         prompts: list[str] = []
         for point in visual_points:
             if not isinstance(point, str) or not point.strip():
                 raise ValueError("visual_points 必须全部为非空字符串")
             prompts.append(point.strip())
 
-        return [await self._generate_image(prompt) for prompt in prompts]
+        batch_cancelled = asyncio.Event()
+
+        async def generate_one(prompt: str) -> str:
+            # 单次工作流通常仅生成 3--5 张图，但仍限制同时发往上游的请求数，
+            # 避免批量任务或重试造成瞬时并发放大。
+            async with self._generation_semaphore:
+                # 某个同批请求失败时，先标记批次再释放全局限流器。这样已在
+                # semaphore 中排队的同批任务即使抢到空位，也不会发起新请求。
+                if batch_cancelled.is_set():
+                    raise asyncio.CancelledError
+                try:
+                    return await self._generate_image(prompt)
+                except BaseException:
+                    batch_cancelled.set()
+                    raise
+
+        # gather 的结果位置与传入协程的位置一致，因此即使请求完成顺序不同，
+        # 调用方收到的 URL 仍与视觉要点一一对应。
+        tasks = [asyncio.create_task(generate_one(prompt)) for prompt in prompts]
+        try:
+            return await asyncio.gather(*tasks)
+        except BaseException:
+            # gather 在某个任务失败时不会自动取消同批其余任务。显式回收它们，
+            # 防止等待中的任务稍后仍发起绘图请求，也避免悬挂的重试协程。
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise

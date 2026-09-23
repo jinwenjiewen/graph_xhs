@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
 from time import perf_counter
-from typing import Any
+from typing import Any, TypeVar
 
-from app.graph.state import AgentState, NodeMetric
+from app.graph.state import NodeMetric, TopicSelectionState
 
 
 @dataclass
@@ -101,14 +101,15 @@ def record_model_usage(response: Any) -> None:
     tracker.add(input_tokens, output_tokens, total_tokens)
 
 
-NodeFunction = Callable[[AgentState], Awaitable[dict[str, object]]]
+StateT = TypeVar("StateT", bound=TopicSelectionState)
+NodeFunction = Callable[[StateT], Awaitable[dict[str, object]]]
 
 
-def instrument_node(node_name: str, node: NodeFunction) -> NodeFunction:
+def instrument_node(node_name: str, node: NodeFunction[StateT]) -> NodeFunction[StateT]:
     """为节点增加 wall-clock 耗时与 token 用量，并把结果追加到持久化状态。"""
 
     @wraps(node)
-    async def wrapped(state: AgentState) -> dict[str, object]:
+    async def wrapped(state: StateT) -> dict[str, object]:
         tracker = _TokenUsageTracker()
         context_token: Token[_TokenUsageTracker | None] = _token_usage_tracker.set(tracker)
         started_at = datetime.now(UTC)

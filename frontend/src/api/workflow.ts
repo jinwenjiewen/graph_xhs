@@ -26,8 +26,12 @@ export interface AgentState {
   generated_topics?: string[]
   selected_topic?: string
   article_content?: string
+  final_content?: string
+  /** 审核通过前端提交的修改意见；服务端兼容旧的 review_feedback。 */
+  human_feedback?: string
   review_feedback?: string
   visual_points?: string[]
+  image_prompts?: string[]
   image_urls?: string[]
   status: WorkflowStatus
   review_decision?: 'approved' | 'rejected'
@@ -40,6 +44,7 @@ export interface WorkflowSnapshot {
   status: WorkflowStatus
   next: string[]
   interrupted: boolean
+  awaiting_human_input?: boolean
   state: AgentState
   message?: string
   generated_topics?: string[]
@@ -47,6 +52,8 @@ export interface WorkflowSnapshot {
 
 export interface HistoryEntry extends WorkflowSnapshot {
   checkpoint_id?: string
+  /** 空字符串表示主图；选题子图快照包含其持久化命名空间。 */
+  checkpoint_ns?: string
   created_at: string
   metadata: Record<string, unknown>
 }
@@ -58,6 +65,7 @@ export interface WorkflowThreadSummary {
   status: WorkflowStatus
   next: string[]
   interrupted: boolean
+  awaiting_human_input?: boolean
   updated_at: string
 }
 
